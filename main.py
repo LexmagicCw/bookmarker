@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-Hybrid PDF segmentation:
-  - Performs OCR on each page.
-  - Computes candidate boundaries using a moving-window semantic similarity approach.
-  - For each candidate boundary, asks Anthropic to confirm if it marks a new document.
-  - If no candidates are confirmed by Anthropic, falls back to using the raw candidate boundaries.
-  - Splits the PDF into separate files based on the confirmed (or fallback) boundaries.
-  
-Tune the parameters (similarity threshold and window size) to get the desired segmentation.
+LLM-based PDF Segmentation
+
+This script:
+  - Performs OCR on each page of a PDF.
+  - Uses an LLM (via Anthropic) to analyze the OCR text and determine which page numbers mark the beginning of new documents.
+  - Splits the PDF into separate files based on these boundaries.
+
+Place your PDFs in the folder named 'input_dir' and the outputs will appear under 'output_dir'.
+Ensure your Anthropic API key is set in a .env file.
 """
 
 import os
+import json
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -20,10 +22,6 @@ import pytesseract
 
 # PDF splitting library
 from PyPDF2 import PdfReader, PdfWriter
-
-# For semantic similarity (sentence embeddings)
-from sentence_transformers import SentenceTransformer, util
-import torch
 
 # Anthropic client (ensure your version is >= 0.4.x)
 from anthropic import Anthropic
@@ -43,99 +41,73 @@ def convert_page_to_text(pdf_path: str, page_num: int, max_chars: int = 2000) ->
     return text[:max_chars]
 
 
-def confirm_boundary(anth_client, prev_text: str, curr_text: str, model_name: str = "claude-3-5-sonnet-latest") -> bool:
+def segment_document_llm(pdf_path: str, num_pages: int, anth_client, model_name: str = "claude-3-5-sonnet-latest") -> list:
     """
-    Uses Anthropic to decide if the current page marks a new document.
-    The prompt asks whether the current page begins a new document and expects ONLY "YES" or "NO".
+    Uses the LLM to segment the PDF.
+
+    It collects the OCR text for every page, builds a prompt that labels each page with its page number,
+    and asks the LLM to return a JSON array of page numbers (1-indexed) that begin new documents.
+    
+    Returns a list of integers.
     """
+    # Extract OCR text from every page.
+    page_texts = [convert_page_to_text(pdf_path, i + 1, max_chars=5000) for i in range(num_pages)]
+    
+    # Build a prompt for the LLM.
+    prompt = (
+        "You are a document segmentation assistant. Below is the OCR text of a multi-document PDF. "
+        "Each page is labeled by its page number. Identify which page numbers mark the beginning of a new document. "
+        "Return only a JSON array of integers representing the page numbers (1-indexed) that start new documents. "
+        "Remember, the first page is always the start of a document.\n\n"
+    )
+    for i, text in enumerate(page_texts):
+        prompt += f"Page {i+1}:\n{text}\n\n"
+    prompt += "Please output only a JSON array of page numbers."
+    
+    print("Sending prompt to LLM for segmentation...")
     try:
         response = anth_client.messages.create(
             model=model_name,
             system="You are a document segmentation assistant.",
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Below are two consecutive pages from a PDF.\n"
-                    "Does the second page mark the beginning of a new document? Answer ONLY YES or NO.\n\n"
-                    f"Previous page text:\n{prev_text}\n\n"
-                    f"Current page text:\n{curr_text}\n"
-                ),
-            }],
-            max_tokens=100,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=300,
         )
         answer_block = response.content[0]
         answer = answer_block.text if hasattr(answer_block, "text") else str(answer_block)
-        answer = answer.strip().upper()
-        return "YES" in answer
+        answer = answer.strip()
+        print("LLM response:", answer)
+        boundaries = json.loads(answer)
+        if not isinstance(boundaries, list):
+            print("LLM response is not a list.")
+            return []
+        return boundaries
     except Exception as e:
-        print("Error in Anthropic boundary decision:", e)
-        return False
+        print("Error in LLM segmentation:", e)
+        return []
 
 
-def hybrid_segment_document(pdf_path: str, num_pages: int, anth_client, threshold: float = 0.55, window_size: int = 2) -> (list, list):
+def build_segments_from_boundaries(boundaries: list, num_pages: int) -> list:
     """
-    Computes candidate document boundaries by:
-      1. Calculating the cosine similarity between the embedding of a moving window
-         (the last `window_size` pages of the current segment) and the next page.
-      2. If the similarity falls below the threshold, the page is flagged as a candidate boundary.
-      3. Each candidate is then confirmed by asking Anthropic.
-      4. If no candidates are confirmed by Anthropic, fall back to using the raw candidate boundaries.
-      
-    Returns:
-      - segments: a list of (start_page, end_page) tuples (0-indexed)
-      - page_texts: list of OCR text for each page (for debugging or further processing)
-    """
-    print("Extracting OCR text for each page...")
-    page_texts = [convert_page_to_text(pdf_path, i + 1, max_chars=5000) for i in range(num_pages)]
-    
-    print("Loading sentence transformer model...")
-    model = SentenceTransformer("all-MiniLM-L6-v2")
-    
-    print("Computing embeddings for each page...")
-    embeddings = model.encode(page_texts, convert_to_tensor=True)
-    
-    candidate_boundaries = []
-    confirmed_boundaries = []
-    current_segment_embeddings = [embeddings[0]]
-    
-    for i in range(1, num_pages):
-        # Use the last `window_size` pages from the current segment as the reference.
-        if len(current_segment_embeddings) >= window_size:
-            window_embeddings = current_segment_embeddings[-window_size:]
-        else:
-            window_embeddings = current_segment_embeddings
-        avg_embedding = torch.mean(torch.stack(window_embeddings), dim=0)
-        sim = util.cos_sim(avg_embedding, embeddings[i]).item()
-        print(f"Candidate check: similarity for page {i+1}: {sim:.2f}")
-        
-        if sim < threshold:
-            candidate_boundaries.append(i)
-            prev_text = page_texts[i - 1]
-            curr_text = page_texts[i]
-            confirmed = confirm_boundary(anth_client, prev_text, curr_text)
-            print(f"Anthropic confirmation for boundary at page {i+1}: {confirmed}")
-            if confirmed:
-                confirmed_boundaries.append(i)
-                current_segment_embeddings = [embeddings[i]]
-            else:
-                current_segment_embeddings.append(embeddings[i])
-        else:
-            current_segment_embeddings.append(embeddings[i])
-    
-    # If Anthropic did not confirm any boundaries, fall back to candidate boundaries.
-    if not confirmed_boundaries and candidate_boundaries:
-        print("No boundaries confirmed by Anthropic; falling back to candidate boundaries.")
-        confirmed_boundaries = candidate_boundaries
+    Converts the LLM-provided page boundaries (1-indexed) into a list of segments (0-indexed tuples).
 
-    # Build segments from confirmed boundaries.
+    For example, if the LLM returns [1, 5, 9] and there are 12 pages, the segments will be:
+      - Segment 1: pages 1 to 4 (0-indexed: (0, 3))
+      - Segment 2: pages 5 to 8 (0-indexed: (4, 7))
+      - Segment 3: pages 9 to 12 (0-indexed: (8, 11))
+    """
+    # Ensure the first page is included.
+    if 1 not in boundaries:
+        boundaries.insert(0, 1)
+    boundaries = sorted(boundaries)
     segments = []
-    start = 0
-    for boundary in confirmed_boundaries:
-        segments.append((start, boundary - 1))
-        start = boundary
-    segments.append((start, num_pages - 1))
-    
-    return segments, page_texts
+    for i in range(len(boundaries)):
+        start = boundaries[i] - 1  # convert to 0-indexed
+        if i < len(boundaries) - 1:
+            end = boundaries[i+1] - 2
+        else:
+            end = num_pages - 1
+        segments.append((start, end))
+    return segments
 
 
 def split_documents(pdf_path: str, segments: list, output_dir: str) -> list:
@@ -166,13 +138,13 @@ def split_documents(pdf_path: str, segments: list, output_dir: str) -> list:
     return output_files
 
 
-def process_single_pdf(pdf_path: str, output_dir: str, anth_client, threshold: float = 0.55, window_size: int = 2) -> int:
+def process_single_pdf(pdf_path: str, output_dir: str, anth_client) -> int:
     """
     Processes a single PDF:
       - Counts the pages.
-      - Uses the hybrid segmentation approach (semantic candidate boundaries confirmed by Anthropic)
-        to determine document segments.
-      - Splits the PDF into separate files based on the detected segments.
+      - Uses the LLM to determine document boundaries.
+      - Converts the boundaries into segments.
+      - Splits the PDF into separate files based on these segments.
       
     Returns the number of document segments found.
     """
@@ -189,11 +161,11 @@ def process_single_pdf(pdf_path: str, output_dir: str, anth_client, threshold: f
     num_pages = len(images)
     print(f"Extracted {num_pages} pages from PDF.")
 
-    print("Segmenting PDF into document segments using hybrid method...")
-    segments, _ = hybrid_segment_document(pdf_path, num_pages, anth_client, threshold, window_size)
-    print("Detected segments (1-indexed page numbers):")
-    for seg in segments:
-        print(f"  - Pages {seg[0] + 1} to {seg[1] + 1}")
+    boundaries = segment_document_llm(pdf_path, num_pages, anth_client)
+    print("LLM suggested boundaries (page numbers):", boundaries)
+    
+    segments = build_segments_from_boundaries(boundaries, num_pages)
+    print("Calculated segments (0-indexed):", segments)
     
     output_files = split_documents(pdf_path, segments, str(pdf_output_dir))
     if output_files:
@@ -229,17 +201,9 @@ def main():
         return
 
     total_segments = 0
-    # Adjust threshold and window_size as needed.
-    similarity_threshold = 0.55
-    window_size = 2
-
     for pdf_file in pdf_files:
-        try:
-            seg_count = process_single_pdf(str(pdf_file), str(output_dir), anth_client,
-                                           threshold=similarity_threshold, window_size=window_size)
-            total_segments += seg_count
-        except Exception as e:
-            print(f"Error processing {pdf_file}: {e}")
+        seg_count = process_single_pdf(str(pdf_file), str(output_dir), anth_client)
+        total_segments += seg_count
 
     print("\nProcessing complete.")
     print(f"Processed {len(pdf_files)} PDF file(s) with a total of {total_segments} document segment(s).")
