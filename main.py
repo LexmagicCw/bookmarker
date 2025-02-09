@@ -58,6 +58,7 @@ def segment_document_llm(pdf_path: str, num_pages: int, anth_client, model_name:
         "You are a document segmentation assistant. Below is the OCR text of a multi-document PDF. "
         "Each page is labeled by its page number. Identify which page numbers mark the beginning of a new document. "
         "Return only a JSON array of integers representing the page numbers (1-indexed) that start new documents. "
+        "Lettered or Numbered exhibits are seperate documents"
         "Remember, the first page is always the start of a document.\n\n"
     )
     for i, text in enumerate(page_texts):
