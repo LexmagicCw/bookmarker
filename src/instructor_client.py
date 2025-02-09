@@ -1,81 +1,108 @@
-import instructor
-from pydantic import BaseModel
-from typing import List
-import time
-from anthropic import Anthropic, APIError, RateLimitError
-import base64
-from openai import OpenAI
+import openai
+from anthropic import Anthropic
 
-class DocumentMetadata(BaseModel):
-    title: str
-    date: str
-    summary: str
-    tags: List[str]
+class DocumentMetadata:
+    """
+    A simple data structure to hold document metadata.
+    Adjust fields as needed for your use case.
+    """
+    def __init__(self, title, date, summary, tags=None):
+        self.title = title
+        self.date = date
+        self.summary = summary
+        self.tags = tags if tags is not None else []
 
 class InstructorClient:
-    def __init__(self, model_client, provider="anthropic", max_retries=3, retry_delay=1):
-        self.provider = provider
-        if provider == "anthropic":
-            self.client = instructor.from_anthropic(model_client)
-        else:
-            self.client = instructor.patch(model_client)
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
-    
-    def extract_metadata(self, pages_data: list[tuple[str, str]], page_markdowns: list[str]) -> DocumentMetadata:
-        retries = 0
-        last_error = None
-        
-        while retries < self.max_retries:
-            try:
-                messages = [
+    """
+    A client that can wrap either OpenAI or Anthropic calls
+    to orchestrate summarizing, instructing, or extracting metadata.
+    """
+    def __init__(self, model_client, model_provider="openai"):
+        """
+        - model_client: 
+            If model_provider='anthropic', this might be an `Anthropic` instance 
+            or a wrapper that calls anthropic.
+            If model_provider='openai', you won't strictly need `model_client`, 
+            since openai is used globally, but you can still pass in a reference.
+        - model_provider: "openai" or "anthropic"
+        """
+        self.model_client = model_client
+        self.model_provider = model_provider.lower()
+
+    def get_summary_openai(self, text: str) -> str:
+        """
+        Summarize using OpenAI completions (text-davinci-003 or similar).
+        """
+        try:
+            response = openai.Completion.create(
+                engine="text-davinci-003",
+                prompt=f"Summarize the following text:\n\n{text}\n\nSummary:",
+                max_tokens=150,
+                temperature=0.7
+            )
+            summary = response["choices"][0]["text"].strip()
+            return summary
+        except Exception as e:
+            print(f"[OpenAI] Error while generating summary: {str(e)}")
+            return ""
+
+    def get_summary_anthropic(self, text: str) -> str:
+        """
+        Summarize using Anthropic's chat API (>=0.4.x).
+        You must have an Anthropic instance that supports .chat(...) or .messages.create(...).
+        """
+        try:
+            # We'll do a simple user prompt with the text, 
+            # and ask the assistant for a summary.
+            if not isinstance(self.model_client, Anthropic):
+                raise ValueError("model_client must be an Anthropic instance for Anthropics mode.")
+
+            response = self.model_client.chat(
+                model="claude-2",  # or "claude-instant-v1" etc.
+                system="You are a helpful assistant that summarizes documents.",
+                messages=[
                     {
                         "role": "user",
-                        "content": [
-                            {"type": "text", "text": "Extract the following information from the given document:\n1. Document Title (use a short but descriptive title)\n2. The date the document was created, or in the case of legal pleadings, the date the document was originally filed, in the format YYYY-MM-DD. If you cannot tell very obviously when the document was created or filed, enter the date as Unknown. Don't guess. Not all dates correspond to the date the document was created or filed, it could just be a date referenced in the document for other reasons.\n3. Document Summary. When you are summarizing the document, keep the following in mind: We represent OxyChem in this proceeding.OxyChem’s interest is ensuring that the cost of these facilities does not get passed on to Entergy’s other customers. OxyChem has 3 large plants in Louisiana, one of which has a CCGT that provides all of its power and the other two of which take all their power from Entergy. OxyChem also has a long-term Purchased Power Agreement (PPA) through which it supplies Entergy with excess power from its CCGT. So, OxyChem may contest whether Entergy should have put the power supply for this new customer out for solicitation through an RFP into which OxyChem could have bid.\n4. Document Tags - Use the Type of Tags You'd Expect An Attorney to Assign in a Document Review Project\n"},
-                        ] + [
-                            item for idx, ((page_b64, _), page_markdown) in enumerate(zip(pages_data, page_markdowns)) for item in [
-                                {"type": "image_url" if self.provider == "openai" else "image",
-                                 "image_url" if self.provider == "openai" else "source": {
-                                     "url" if self.provider == "openai" else "type": f"data:image/png;base64,{page_b64}" if self.provider == "openai" else "base64",
-                                     "detail": "high" if self.provider == "openai" else None,
-                                     "media_type": "image/png" if self.provider == "anthropic" else None,
-                                     "data": page_b64 if self.provider == "anthropic" else None
-                                 }},
-                                {"type": "text", "text": f"Page {idx+1} formatted content:\n{page_markdown}\n---"}
-                            ]
-                        ]
+                        "content": f"Summarize the following text:\n\n{text}\n\nSummary:"
                     }
-                ]
-                
-                model = "claude-3-5-sonnet-latest" if self.provider == "anthropic" else "gpt-4o"
-                return self.client.chat.completions.create(
-                    model=model,
-                    max_tokens=8000,
-                    messages=messages,
-                    response_model=DocumentMetadata,
-                )
-            except RateLimitError as e:
-                retries += 1
-                last_error = e
-                if retries == self.max_retries:
-                    break
-                print(f"Rate limit hit, retrying in {self.retry_delay} seconds...")
-                time.sleep(self.retry_delay * (2 ** (retries - 1)))  # Exponential backoff
-            except APIError as e:
-                retries += 1
-                last_error = e
-                if retries == self.max_retries:
-                    break
-                print(f"API error occurred, retrying in {self.retry_delay} seconds...")
-                time.sleep(self.retry_delay)
-            except Exception as e:
-                # For unexpected errors, fail immediately
-                raise Exception(f"Unexpected error during metadata extraction: {str(e)}") from e
-        
-        # If we've exhausted retries, raise the last error
-        if last_error:
-            if isinstance(last_error, RateLimitError):
-                raise Exception(f"Rate limit exceeded after {retries} retries") from last_error
-            else:
-                raise Exception(f"API error after {retries} retries: {str(last_error)}") from last_error
+                ],
+                max_tokens=300,
+                temperature=0.7
+            )
+            # In the new Anthropic library, the summary is at response.completion
+            summary = response.completion.strip()
+            return summary
+        except Exception as e:
+            print(f"[Anthropic] Error while generating summary: {str(e)}")
+            return ""
+
+    def get_summary(self, text: str) -> str:
+        """
+        Route to the correct summarization method depending on the provider.
+        """
+        if self.model_provider == "openai":
+            return self.get_summary_openai(text)
+        elif self.model_provider == "anthropic":
+            return self.get_summary_anthropic(text)
+        else:
+            raise ValueError(f"Unsupported model provider: {self.model_provider}")
+
+    def analyze_document(self, text: str) -> DocumentMetadata:
+        """
+        Analyze a document (generate summary, possibly more)
+        and return DocumentMetadata.
+        """
+        summary = self.get_summary(text)
+        # Placeholder logic for title, date, and tags
+        return DocumentMetadata(
+            title="Untitled Document",
+            date="Unknown Date",
+            summary=summary,
+            tags=["example", self.model_provider]
+        )
+
+    def extract_metadata(self, text: str) -> DocumentMetadata:
+        """
+        Wrapper for `analyze_document` to align with expected method usage.
+        """
+        return self.analyze_document(text)
